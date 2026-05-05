@@ -138,6 +138,8 @@ class Request:
 
         # Used in async scheduling.
         self.num_output_placeholders = 0
+        # Used in pp.
+        self.num_spec_tokens_in_flight = 0
         # Used in forced preemption (reset_prefix_cache) with async scheduling.
         self.discard_latest_async_tokens = False
 
