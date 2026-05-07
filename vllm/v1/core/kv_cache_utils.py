@@ -1253,6 +1253,55 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    # Check for layer-wise offload to adjust memory allocation
+    enable_layerwise_offload = False
+    physical_layers = 0
+    if vllm_config.kv_transfer_config:
+        role = vllm_config.kv_transfer_config.kv_role
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        
+        use_layerwise = extra.get("use_layerwise", False)
+        num_write_buffers = extra.get("kv_offload_num_buffers", 0)
+        num_read_buffers = extra.get("kv_offload_num_read_buffers", 2)
+        
+        if role in ["kv_producer", "kv_both"] and use_layerwise and num_write_buffers > 0:
+            enable_layerwise_offload = True
+            physical_layers = num_write_buffers + num_read_buffers
+
+    if enable_layerwise_offload:
+        from collections import defaultdict
+        page_size_to_layers = defaultdict(list)
+        for group in kv_cache_groups:
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+                specs = group.kv_cache_spec.kv_cache_specs
+                for name in group.layer_names:
+                    page_size_to_layers[specs[name].page_size_bytes].append(name)
+            else:
+                for name in group.layer_names:
+                    page_size_to_layers[group.kv_cache_spec.page_size_bytes].append(name)
+
+        total_page_size_bytes = sum(page_size for page_size in page_size_to_layers.keys())
+        # available_memory is divided among the physical_layers we will instantiate
+        num_blocks = int(available_memory // (total_page_size_bytes * physical_layers))
+        
+        from vllm.v1.core.kv_cache_utils import may_override_num_blocks
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+
+        kv_cache_tensors = []
+        for page_size, layers in page_size_to_layers.items():
+            # Return exactly 1 tensor per page size.
+            # vLLM will allocate 1 physical tensor.
+            # LayerwiseOffloadManager will allocate the remaining (physical_layers - 1) tensors.
+            kv_cache_tensors.append(
+                KVCacheTensor(size=page_size * num_blocks, shared_by=layers)
+            )
+
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+        )
+
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
